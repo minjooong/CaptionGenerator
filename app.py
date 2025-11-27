@@ -14,8 +14,19 @@ def format_timestamp(seconds):
     seconds = math.floor(seconds)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
 
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import re
 from collections import Counter
+
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
 
 def format_text(text):
     """
@@ -27,12 +38,6 @@ def format_text(text):
     text = re.sub(r"[.?!\-;:,']", '', text)
     return text
 
-def split_into_segments(words, max_chars=14):
-    """
-    Splits a list of word objects into subtitle segments, 
-    ensuring each segment is at most max_chars long.
-    Returns a list of dicts: {'start': float, 'end': float, 'text': str}
-    """
 def split_into_segments(words, max_chars=16):
     """Splits a list of words into segments based on character limit and punctuation."""
     segments = []
@@ -92,68 +97,80 @@ def generate_srt_content(segments):
         srt_content += f"{i}\n{start_time} --> {end_time}\n{text}\n\n"
     return srt_content
 
-def extract_prompt_words(script_text, limit=50):
-    """Extracts important words from script for Whisper prompt, stripping particles."""
-    if not script_text:
+def extract_keywords_with_gemini(script_text, limit=50):
+    """Extracts keywords using Google Gemini API."""
+    if not HAS_GEMINI:
+        st.error("Google Generative AI library not found.")
         return None
         
-    # Normalize and split
-    words = re.findall(r'\w+', script_text)
-    
-    # Common Korean particles/endings to strip
-    # Order matters: longer matches first
-    suffixes = [
-        '에게서', '에서는', '에서도', '이라는', '이라고', '으로는', '으로도', '까지는', '까지도', '부터는', '부터도',
-        '에서는', '에게는', '에게도', '한테는', '한테도', '께서는', '께서는', '입니다', '습니다', '합니다', '하고는',
-        '에게', '에서', '으로', '까지', '부터', '한테', '께서', '처럼', '하고', '이나', '이랑', '이라', '와는', '과는',
-        '은', '는', '이', '가', '을', '를', '의', '에', '로', '와', '과', '도', '만', '나', '랑', '야', '여', '라', '고'
-    ]
-    
-    processed_words = []
-    for w in words:
-        # Skip very short words initially
-        if len(w) < 2:
-            continue
-            
-        stripped = w
-        # Try to strip suffix
-        for suffix in suffixes:
-            if stripped.endswith(suffix):
-                # Ensure we don't strip the whole word or leave just 1 char if possible
-                # But if the word IS the suffix (rare for nouns), keep it?
-                # Heuristic: Only strip if remaining length >= 1
-                if len(stripped) > len(suffix):
-                    stripped = stripped[:-len(suffix)]
-                    break # Stop after first match (greedy)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        st.warning("GEMINI_API_KEY not found in .env file. Please add it.")
+        return None
         
-        # Only keep if remaining part is still meaningful (len >= 2)
-        if len(stripped) >= 2:
-            processed_words.append(stripped)
-    
-    # Count frequency
-    counter = Counter(processed_words)
-    
-    # Get top N most common words
-    top_tuples = counter.most_common(limit)
-    
-    # Extract just the words
-    top_words = [word for word, count in top_tuples]
-    
-    # Optimization: Check total length to fit within Whisper's context (approx 224 tokens)
-    # A safe heuristic is ~800 characters for Korean/mixed text.
-    final_words = []
-    current_len = 0
-    max_len = 800
-    
-    for word in top_words:
-        # +2 for ", "
-        if current_len + len(word) + 2 > max_len:
-            break
-        final_words.append(word)
-        current_len += len(word) + 2
-    
-    # Join with commas for a keyword list style prompt
-    return ", ".join(final_words)
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        prompt = f"""
+        Analyze the following text and extract exactly {limit} keywords.
+        
+        Prioritize:
+        1. People's names (Crucial)
+        2. Proper nouns (Places, Organizations)
+        3. Technical terms
+        4. Important nouns that appear frequently
+        
+        Rules:
+        - Extract as many relevant words as possible to reach the target of {limit}.
+        - Exclude common verbs and simple adjectives.
+        - Output ONLY the comma-separated list.
+        
+        Text:
+        {script_text[:10000]}
+        """
+        
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        st.error(f"Gemini Error: {e}")
+        return None
+
+def correct_with_gemini(srt_content):
+    """Corrects SRT content using Gemini API."""
+    if not HAS_GEMINI:
+        st.error("Google Generative AI library not found.")
+        return None
+        
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        st.error("GEMINI_API_KEY not found in .env file.")
+        return None
+        
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        prompt = f"""
+        You are a professional subtitle editor. 
+        Please correct any typos, spelling mistakes, and grammatical errors in the following Korean SRT subtitles.
+        
+        IMPORTANT RULES:
+        1. Keep the exact SRT format (numbers, timestamps, blank lines).
+        2. Do NOT change the timing.
+        3. Only correct the text content.
+        4. Remove any punctuation (commas, periods, question marks) from the corrected text if they were added, to maintain the clean style.
+        5. Output ONLY the corrected SRT content, no other text.
+        
+        SRT Content:
+        {srt_content}
+        """
+        
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        st.error(f"Gemini API Error: {e}")
+        return None
 
 def transcribe_audio(audio_path, initial_prompt=None, max_chars=16, progress_bar=None):
     """Transcribes audio using Faster-Whisper."""
@@ -226,49 +243,59 @@ with st.sidebar:
     
     st.divider()
     prompt_limit = st.slider("Prompt Word Count", min_value=10, max_value=100, value=50, step=10)
-    st.caption("Number of frequent words to extract from script.")
+    st.caption("Number of keywords to extract from script.")
 
 uploaded_file = st.file_uploader("Upload MP3 Audio", type=["mp3", "wav", "m4a"])
 script_text = st.text_area("Script (Optional - helps with accuracy)", height=200, placeholder="Paste your script here...")
-
-initial_prompt = None
-if script_text:
-    initial_prompt = extract_prompt_words(script_text, limit=prompt_limit)
-    if initial_prompt:
-        with st.expander("ℹ️ Extracted Context Words (Click to view)", expanded=False):
-            st.info(initial_prompt)
-            st.caption(f"Top {len(initial_prompt.split(', '))} frequent words (len >= 2) sent to AI.")
 
 # Initialize session state
 if 'segments' not in st.session_state:
     st.session_state.segments = None
 if 'srt_output' not in st.session_state:
     st.session_state.srt_output = None
+if 'corrected_srt' not in st.session_state:
+    st.session_state.corrected_srt = None
+if 'extracted_keywords' not in st.session_state:
+    st.session_state.extracted_keywords = None
+
+initial_prompt = None
 
 if uploaded_file is not None:
     st.audio(uploaded_file, format='audio/mp3')
     
-    if st.button("Generate Subtitles"):
+    if st.button("Generate Subtitles", type="primary"):
+        # Reset corrected SRT on new generation
+        st.session_state.corrected_srt = None
+        
+        # 1. Extract Keywords (if script provided)
+        if script_text:
+            with st.spinner("Step 1/2: Extracting keywords from script with Gemini..."):
+                initial_prompt = extract_keywords_with_gemini(script_text, limit=prompt_limit)
+                if initial_prompt:
+                    st.session_state.extracted_keywords = initial_prompt
+                    st.info(f"Context: {initial_prompt}")
+        
         # Save uploaded file to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
             tmp_file.write(uploaded_file.getvalue())
             tmp_path = tmp_file.name
 
         try:
-            progress_bar = st.progress(0, text="Starting transcription...")
-            
-            segments = transcribe_audio(tmp_path, initial_prompt, max_chars, progress_bar)
-            
-            if segments:
-                srt_output = generate_srt_content(segments)
+            with st.spinner("Step 2/2: Generating subtitles... (This may take a moment)"):
+                progress_bar = st.progress(0, text="Starting transcription...")
                 
-                # Save to session state
-                st.session_state.segments = segments
-                st.session_state.srt_output = srt_output
+                segments = transcribe_audio(tmp_path, initial_prompt, max_chars, progress_bar)
                 
-                st.success("Transcription Complete!")
-            else:
-                st.error("Transcription failed or returned no segments.")
+                if segments:
+                    srt_output = generate_srt_content(segments)
+                    
+                    # Save to session state
+                    st.session_state.segments = segments
+                    st.session_state.srt_output = srt_output
+                    
+                    st.success("Transcription Complete!")
+                else:
+                    st.error("Transcription failed or returned no segments.")
         
         except Exception as e:
             st.error(f"An error occurred: {e}")
@@ -283,12 +310,37 @@ if st.session_state.segments:
     st.divider()
     st.subheader("Results")
     
-    st.download_button(
-        label="Download SRT",
-        data=st.session_state.srt_output,
-        file_name="subtitles.srt",
-        mime="text/plain",
-        key="download_original"
-    )
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.download_button(
+            label="Download Original SRT",
+            data=st.session_state.srt_output,
+            file_name="subtitles.srt",
+            mime="text/plain",
+            key="download_original"
+        )
+        
+    with col2:
+        if st.button("✨ Auto-Correct with Gemini"):
+            with st.spinner("Correcting typos and grammar with Gemini..."):
+                corrected_srt = correct_with_gemini(st.session_state.srt_output)
+                if corrected_srt:
+                    st.session_state.corrected_srt = corrected_srt
+                    st.success("Correction Complete!")
+        # The `correct_with_gemini` function internally checks for API key and handles errors.
+        # So, the disabled button logic is now handled within the function or by its return value.
 
-    st.text_area("Preview Subtitles", st.session_state.srt_output, height=300)
+    st.text_area("Preview Subtitles (Original)", st.session_state.srt_output, height=300)
+    
+    if st.session_state.corrected_srt:
+        st.divider()
+        st.subheader("✨ Corrected Subtitles")
+        st.download_button(
+            label="Download Corrected SRT",
+            data=st.session_state.corrected_srt,
+            file_name="subtitles_corrected.srt",
+            mime="text/plain",
+            key="download_corrected"
+        )
+        st.text_area("Preview Corrected", st.session_state.corrected_srt, height=300)
